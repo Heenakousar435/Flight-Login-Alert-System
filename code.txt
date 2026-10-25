@@ -1,0 +1,216 @@
+Backend- appproject.py
+# Backend- appproject.py (Main Parts)
+# ==================== IMPORTS ====================
+import os
+from datetime import datetime
+from functools import wraps
+from flask import Flask, request, jsonify, session
+from flask_cors import CORS
+from configureproject import Config
+from modulesproject import db, Admin, Flight, Passenger, Alert, MessageHistory, AlertType
+from smsproject import SMSService, AlertMessageTemplates
+# ==================== APP SETUP ====================
+def create_app(config_class=Config):
+app = Flask(__name__)
+app.config.from_object(config_class)
+db.init_app(app)
+CORS(app)
+sms_service = SMSService(
+account_sid=app.config['TWILIO_ACCOUNT_SID'],
+auth_token=app.config['TWILIO_AUTH_TOKEN'],
+phone_number=app.config['TWILIO_PHONE_NUMBER']
+)
+app.sms_service = sms_service
+34
+with app.app_context():
+db.create_all()
+create_default_admin()
+# ==================== AUTHENTICATION ====================
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+data = request.get_json()
+username = data.get('username')
+password = data.get('password')
+if not username or not password:
+return jsonify({'error': 'Username and password required'}), 400
+admin = Admin.query.filter_by(username=username).first()
+if admin and admin.check_password(password):
+session['admin_id'] = admin.id
+session['admin_username'] = admin.username
+admin.last_login = datetime.utcnow()
+db.session.commit()
+return jsonify({'message': 'Login successful', 'admin': {'id': admin.id, 'username':
+admin.username}})
+return jsonify({'error': 'Invalid credentials'}), 401
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+session.clear()
+return jsonify({'message': 'Logged out successfully'})
+# ==================== FLIGHT MANAGEMENT====================
+@app.route('/api/flights', methods=['GET'])
+@login_required
+def get_flights():
+page = request.args.get('page', 1, type=int)
+pagination =
+Flight.query.order_by(Flight.scheduled_departure.desc()).paginate(page=page, per_page=10)
+return jsonify({'flights': [f.to_dict() for f in pagination.items], 'total': pagination.total})
+@app.route('/api/flights', methods=['POST'])
+@login_required
+def create_flight():
+data = request.get_json()
+flight = Flight(
+flight_number=data['flight_number'], airline=data['airline'],
+origin=data['origin'], destination=data['destination'],
+scheduled_departure=datetime.fromisoformat(data['scheduled_departure']),
+scheduled_arrival=datetime.fromisoformat(data['scheduled_arrival']),
+gate=data.get('gate'), status=data.get('status', 'Scheduled')
+)
+db.session.add(flight)
+db.session.commit()
+return jsonify({'message': 'Flight created successfully', 'flight': flight.to_dict()}), 201
+@app.route('/api/flights/<int:flight_id>', methods=['DELETE'])
+@login_required
+def delete_flight(flight_id):
+flight = Flight.query.get_or_404(flight_id)
+db.session.delete(fligh
+db.session.commit()
+return jsonify({'message': 'Flight deleted successfully'})
+# ==================== SEND SMSALERT ====================
+@app.route('/api/alerts/send', methods=['POST'])
+@login_required
+def send_alert():
+data = request.get_json()
+flight_id = data.get('flight_id')
+alert_type = data.get('alert_type')
+flight = Flight.query.get_or_404(flight_id)
+passengers = Passenger.query.filter_by(flight_id=flight_id, sms_opt_in=True).all()
+if not passengers:
+return jsonify({'error': 'No passengers found with SMS opt-in'}), 404
+message = AlertMessageTemplates.delay_alert(flight.flight_number,
+data.get('new_time'), data.get('reason'))
+results = {'successful': 0, 'failed': 0}
+for passenger in passengers:
+sms_result = sms_service.send_sms(passenger.phone_number, message)
+msg_history = MessageHistory(
+passenger_id=passenger.id, phone_number=passenger.phone_number,
+message=message, alert_type=alert_type,
+status='sent' if sms_result['success'] else 'failed'
+)
+db.session.add(msg_history)
+if sms_result['success']:
+results['successful'] += 1
+else:
+results['failed'] += 1
+db.session.commit()
+return jsonify({'message': f"Alert sent to {results['successful']} passengers", 'results':
+results})
+# ==================== HEALTH CHECK ====================
+@app.route('/api/health', methods=['GET'])
+def health_check():
+return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+return app
+if __name__ == '__main__':
+app = create_app()
+app.run(host='127.0.0.1', port=5001, debug=True)
+
+Frontend- frontendappproject.py
+# Frontend- frontendappproject.py (Main Parts)
+# ==================== IMPORTS ====================
+import os
+import requests
+from datetime import datetime
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, flash, session
+from configureproject import Config
+app = Flask(__name__,
+template_folder='frontend/templates',
+static_folder='frontend/static')
+app.config.from_object(Config)
+app.secret_key = Config.SECRET_KEY
+API_BASE_URL = 'http://127.0.0.1:5001/api'
+# ==================== LOGIN REQUIRED DECORATOR ==================
+def login_required(f):
+@wraps(f)
+def decorated_function(*args, **kwargs):
+if 'admin_id' not in session:
+flash('Please login to continue', 'warning')
+return redirect(url_for('login'))
+return f(*args, **kwargs)
+return decorated_function
+# ==================== API REQUEST HELPER ====================
+def api_request(method, endpoint, data=None):
+url = f"{API_BASE_URL}/{endpoint}"
+cookies = {'session': request.cookies.get('session', ')}
+try:
+if method == 'GET':
+response = requests.get(url, cookies=cookies, timeout=10)
+elif method == 'POST':
+response = requests.post(url, json=data, cookies=cookies, timeout=10)
+elif method == 'PUT':
+response = requests.put(url, json=data, cookies=cookies, timeout=10)
+elif method == 'DELETE':
+response = requests.delete(url, cookies=cookies, timeout=10)
+return response.json() if response.content else {}
+except requests.exceptions.RequestException as e:
+return {'error': str(e)}
+# ==================== AUTHENTICATION ROUTES ====================
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+if request.method == 'POST':
+username = request.form.get('username')
+password = request.form.get('password')
+response = api_request('POST', 'auth/login', {'username': username, 'password':
+password})
+if 'error' in response:
+flash(response['error'], 'error')
+return render_template('login.html')
+session['admin_id'] = response['admin']['id']
+session['admin_username'] = response['admin']['username']
+flash('Login successful!', 'success')
+return redirect(url_for('dashboard'))
+return render_template('login.html')
+@app.route('/logout')
+def logout():
+api_request('POST', 'auth/logout')
+session.clear()
+flash('You have been logged out', 'info')
+return redirect(url_for('login'))
+# ==================== DASHBOARD ====================
+@app.route('/dashboard')
+@login_required
+def dashboard():
+stats = api_request('GET', 'dashboard/stats')
+recent_flights = api_request('GET', 'flights?per_page=5')
+recent_messages = api_request('GET', 'messages?per_page=5')
+return render_template('dashboard.html',
+stats=stats,
+recent_flights=recent_flights.get('flights', []),
+recent_messages=recent_messages.get('messages', []))
+# ==================== SEND ALERT ====================
+@app.route('/send-alert', methods=['GET', 'POST'])
+@login_required
+def send_alert():
+if request.method == 'POST':
+
+alert_data = {
+'flight_id': int(request.form.get('flight_id')),
+'alert_type': request.form.get('alert_type'),
+'message': request.form.get('custom_message'),
+'new_time': request.form.get('new_time'),
+'reason': request.form.get('reason')
+}
+response = api_request('POST', 'alerts/send', alert_data)
+if 'error' in response:
+flash(response['error'], 'error')
+else:
+results = response.get('results', {})
+flash(f"Alert sent! {results.get('successful', 0)} sent, {results.get('failed', 0)} failed",
+'success')
+return redirect(url_for('message_history'))
+flights_data = api_request('GET', 'flights?per_page=100')
+alert_types = api_request('GET', 'alerts/types')
+return render_template('send_alert.html',
+flights=flights_data.get('flights', []),
+alert_types=alert_types.get('alert_types', []))
+if __name__ == '__main__':
+app.run(host='0.0.0.0', port=3000, debug=True)
